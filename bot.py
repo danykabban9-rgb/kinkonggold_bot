@@ -1,150 +1,112 @@
-import os
-import time
-import threading
-import requests
-from flask import Flask
-from telegram import Bot
-from anthropic import Anthropic
+import os, datetime, requests
+from twelvedata import TDClient
+from telegram.ext import Updater, CommandHandler
 
-app = Flask(__name__)
+# Load API keys
+td = TDClient(apikey=os.getenv("TWELVE_DATA_KEY"))
+telegram_token = os.getenv("TELEGRAM_TOKEN")
 
-# Config
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-CHAT_ID = os.getenv('CHAT_ID', '3695615958')
-TWELVE_DATA_KEY = os.getenv('TWELVE_DATA_KEY')
-CLAUDE_API_KEY = os.getenv('CLAUDE_API_KEY')
+# Danger zones (illiquid hours + example news times)
+danger_hours = range(0, 3)  # midnight to 3am UTC
+news_times = ["13:30", "19:00"]  # example: NFP, FOMC
 
-bot = Bot(token=TELEGRAM_TOKEN)
-client = Anthropic()
+def in_danger_zone():
+    now = datetime.datetime.utcnow()
+    if now.hour in danger_hours:
+        return True
+    if now.strftime("%H:%M") in news_times:
+        return True
+    return False
 
-def get_price_data():
-    """Fetch XAUUSD candles from Twelve Data"""
-    try:
-        url = "https://api.twelvedata.com/time_series"
-        params = {
-            'symbol': 'XAUUSD',
-            'interval': '5min',
-            'outputsize': 100,
-            'apikey': TWELVE_DATA_KEY
-        }
-        resp = requests.get(url, params=params, timeout=10)
-        data = resp.json()
-        return data.get('values', [])
-    except Exception as e:
-        print(f"Error fetching price: {e}")
-        return []
+def detect_patterns(closes):
+    # Simple candlestick pattern detection
+    if closes[-1] < closes[-2] and closes[-2] > closes[-3]:
+        return "Double Top"
+    if closes[-1] > closes[-2] and closes[-2] < closes[-3]:
+        return "Double Bottom"
+    if closes[-2] < closes[-3] and closes[-1] > closes[-2]:
+        return "Engulfing Bullish"
+    if closes[-2] > closes[-3] and closes[-1] < closes[-2]:
+        return "Engulfing Bearish"
+    return None
 
-def analyze_with_claude(price_data):
-    """Send chart data to Claude for analysis"""
-    if not price_data:
-        return None
-    
-    # Build prompt with latest candles
-    latest = price_data[:20]
-    price_str = ""
-    for c in latest:
-        price_str += f"Time: {c['datetime']}, Open: {c['open']}, High: {c['high']}, Low: {c['low']}, Close: {c['close']}\n"
-    
-    prompt = "Analyze this XAUUSD 5min chart data (20 latest candles):\n" + price_str + "\n\nEvaluate ONLY these indicators:\n- RSI (14)\n- EMA 15\n- EMA 45\n- Candle patterns (pin bar, engulfing, consolidation)\n- Support/Resistance from price action\n\nGive me:\n1. Market Strength (0-100%)\n2. Signal: BUY, SELL, or WAIT\n3. One-line reason\n\nFormat:\nSTRENGTH: [number]\nSIGNAL: [BUY/SELL/WAIT]\nREASON: [brief]"
+def support_resistance(closes):
+    support = min(closes[-20:])
+    resistance = max(closes[-20:])
+    return support, resistance
 
-    try:
-        response = client.messages.create(
-            model="claude-3-5-haiku-20241022",
-            max_tokens=150,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return response.content[0].text
-    except Exception as e:
-        print(f"Claude error: {e}")
-        return None
+def get_prediction(short_ma, long_ma, rsi, pattern, support, resistance, price):
+    forecast = "Neutral"
+    reasons = []
 
-def parse_claude_response(response):
-    """Extract strength, signal, reason"""
-    if not response:
-        return None
-    
-    try:
-        lines = response.strip().split('\n')
-        strength = None
-        signal = None
-        reason = ""
-        
-        for line in lines:
-            if 'STRENGTH:' in line:
-                strength = int(''.join(filter(str.isdigit, line.split(':')[1])))
-            elif 'SIGNAL:' in line:
-                signal = line.split(':')[1].strip()
-            elif 'REASON:' in line:
-                reason = line.split(':')[1].strip()
-        
-        return {'strength': strength, 'signal': signal, 'reason': reason}
-    except:
-        return None
+    if short_ma > long_ma and rsi < 70:
+        forecast = "Bullish"
+        reasons.append("MA crossover + RSI healthy")
+    elif short_ma < long_ma and rsi > 30:
+        forecast = "Bearish"
+        reasons.append("MA crossover + RSI weak")
 
-def send_alert(signal_data):
-    """Send Telegram alert"""
-    if not signal_data or signal_data['strength'] < 75:
-        return
-    
-    signal = signal_data['signal']
-    strength = signal_data['strength']
-    reason = signal_data['reason']
-    
-    if signal == 'BUY':
-        emoji = '🟢'
-        entry = 'Entry price: Check chart'
-        sl = 'SL: Entry - 2 points'
-        tp = 'TP: Entry + 3 points'
-    elif signal == 'SELL':
-        emoji = '🔴'
-        entry = 'Entry price: Check chart'
-        sl = 'SL: Entry + 2 points'
-        tp = 'TP: Entry - 3 points'
+    if pattern == "Double Bottom":
+        forecast = "Bullish"
+        reasons.append("Double Bottom reversal")
+    elif pattern == "Double Top":
+        forecast = "Bearish"
+        reasons.append("Double Top reversal")
+
+    if price > resistance * 0.98:
+        forecast = "Possible breakout up"
+        reasons.append("Near resistance with momentum")
+    elif price < support * 1.02:
+        forecast = "Possible breakdown down"
+        reasons.append("Near support with weakness")
+
+    return f"🔮 Prediction: {forecast}\nReasons: {', '.join(reasons)}"
+
+def get_signal():
+    if in_danger_zone():
+        return "⚠️ No trade — dangerous market time."
+
+    # Fetch gold data
+    data = td.time_series(symbol="XAU/USD", interval="5min", outputsize=50).as_json()
+    closes = [float(candle['close']) for candle in data]
+    price = closes[-1]
+
+    short_ma = sum(closes[-5:]) / 5
+    long_ma = sum(closes[-20:]) / 20
+    pattern = detect_patterns(closes)
+    support, resistance = support_resistance(closes)
+
+    # RSI calculation
+    gains = [closes[i+1]-closes[i] for i in range(len(closes)-1) if closes[i+1]>closes[i]]
+    losses = [closes[i]-closes[i+1] for i in range(len(closes)-1) if closes[i+1]<closes[i]]
+    avg_gain = sum(gains[-14:]) / 14 if gains else 0
+    avg_loss = sum(losses[-14:]) / 14 if losses else 1
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    # Probability scoring
+    score = 0
+    if short_ma > long_ma: score += 20
+    if pattern in ["Double Bottom", "Engulfing Bullish"]: score += 20
+    if pattern in ["Double Top", "Engulfing Bearish"]: score += 20
+    if 30 < rsi < 70: score += 20
+    if price > support and price < resistance: score += 20
+
+    prediction = get_prediction(short_ma, long_ma, rsi, pattern, support, resistance, price)
+
+    if score >= 75:
+        if short_ma > long_ma and pattern in ["Double Bottom", "Engulfing Bullish"]:
+            return f"📈 Buy Signal\nEntry: {price}\nSL: {support}\nTP: {resistance}\nSuccess %: {score}\n{prediction}"
+        elif short_ma < long_ma and pattern in ["Double Top", "Engulfing Bearish"]:
+            return f"📉 Sell Signal\nEntry: {price}\nSL: {resistance}\nTP: {support}\nSuccess %: {score}\n{prediction}"
+        else:
+            return f"⚠️ No trade — filters not aligned despite {score}% score.\n{prediction}"
     else:
-        return
-    
-    message = emoji + " " + signal + " SIGNAL\n"
-    message += "Market Strength: " + str(strength) + "%\n"
-    message += entry + "\n"
-    message += sl + "\n"
-    message += tp + "\n"
-    message += "Reason: " + reason
-    
-    try:
-        bot.send_message(chat_id=CHAT_ID, text=message)
-    except Exception as e:
-        print(f"Telegram error: {e}")
+        return f"⚠️ No trade — success probability only {score}%, below safe threshold.\n{prediction}"
 
-def scan_loop():
-    """Auto-scan every 5 minutes"""
-    last_signal = None
-    while True:
-        try:
-            price_data = get_price_data()
-            if price_data:
-                analysis = analyze_with_claude(price_data)
-                signal_data = parse_claude_response(analysis)
-                
-                if signal_data and signal_data['signal'] != last_signal:
-                    send_alert(signal_data)
-                    last_signal = signal_data['signal']
-            
-            time.sleep(300)  # 5 minutes
-        except Exception as e:
-            print(f"Scan error: {e}")
-            time.sleep(300)
+def signal(update, context):
+    update.message.reply_text(get_signal())
 
-@app.route('/telegram', methods=['POST'])
-def telegram_webhook():
-    return {'ok': True}
-
-@app.route('/health', methods=['GET'])
-def health():
-    return {'status': 'ok'}
-
-if __name__ == '__main__':
-    # Start scanner in background
-    scanner = threading.Thread(target=scan_loop, daemon=True)
-    scanner.start()
-    
-    app.run(host='0.0.0.0', port=5000)
+updater = Updater(telegram_token)
+updater.dispatcher.add_handler(CommandHandler("signal", signal))
+updater.start_polling()
